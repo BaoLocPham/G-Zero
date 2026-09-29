@@ -6,13 +6,11 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 MODEL=${MODEL:-Qwen/Qwen3-8B-Base}
-RENDERER=${RENDERER:-qwen3}
 
 for NQ in 500 1000 2000 5000; do
   bash run.sh \
     --tag "ablation_scaling/n${NQ}" \
     --model_name "$MODEL" \
-    --renderer_name "$RENDERER" \
     --run_phase1 false \
     --num_questions "$NQ" \
     --pct_low 0 --pct_high 50 \

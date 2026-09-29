@@ -9,7 +9,6 @@ cd "$(dirname "$0")/.."
 exec bash run.sh \
   --tag ablation_no_phase1 \
   --model_name Qwen/Qwen3-8B-Base \
-  --renderer_name qwen3 \
   --run_phase1 false \
   --num_questions 2000 \
   --pct_low 0 --pct_high 50 \

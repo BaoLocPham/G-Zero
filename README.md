@@ -112,38 +112,42 @@ snapshot via `save_weights_and_get_sampling_client`).
 ## Setup
 
 ```bash
-git clone <this-repo> && cd release/
-python -m venv .venv && source .venv/bin/activate
+git clone <this-repo> && cd G-Zero/
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-export TINKER_API_KEY=<your-key>          # https://tinker.thinkingmachines.ai/
+export CUDA_VISIBLE_DEVICES=2,3          # training: first visible GPU runs vLLM, second runs PEFT
 ```
 
-If `instruction_following_eval` is not on PyPI for your environment:
-
-```bash
-pip install git+https://github.com/google-research/google-research.git#subdirectory=instruction_following_eval
-```
-
-No local GPU needed — all training and sampling runs on
-[Tinker](https://thinkingmachines.ai/tinker).
+Training uses two visible NVIDIA GPUs. Inference-only evaluation supports
+tensor parallelism over two GPUs with `--vllm_tensor_parallel_size 2`.
+The default model is the cached Qwen3-4B-Base at
+`/home/locpb/self-evolution-repro/papers/agent0/shared-models/Qwen3-4B-Base`. Evaluation datasets are
+downloaded from Hugging Face on first use; inference and training then run
+locally. No judge model or model-calling API is used. The local 4B bot50 and
+top50 adapters have completed one training round. Set `--model_name` to use a
+different model.
 
 ---
 
-## Reproducing the paper
+## Running the experiments
 
-| Experiment                         | Script                                          | Approx. cost   |
-|------------------------------------|-------------------------------------------------|----------------|
-| Main — Qwen3-8B-Base, R1           | `bash scripts/main_qwen3_8b_base.sh`            | ~$5–8, 5–7 h   |
-| Main — Llama-3.1-8B-Instruct       | `bash scripts/main_llama3_8b_instruct.sh`       | ~$5–8, 5–7 h   |
-| Ablation — no Phase 1              | `bash scripts/ablation_no_phase1.sh`            | ~$3–5, 3–5 h   |
-| Ablation — δ-cutoff sweep          | `bash scripts/ablation_cutoffs.sh`              | ~$8–12, 6–10 h |
-| Ablation — pool-size scaling       | `bash scripts/ablation_scaling.sh`              | ~$10–15, 8–14h |
-| Ablation — multi-round (R1 → R3)   | `bash scripts/ablation_multi_round.sh`          | ~$15–25, 15–20h|
-| Eval-only on existing checkpoint   | `bash scripts/eval_only.sh <sampler_uri>`       | ~$1, 1–1.5 h   |
+| Experiment                         | Script                                          |
+|------------------------------------|-------------------------------------------------|
+| Main — local Qwen3-4B-Base, R1      | `bash scripts/main_qwen3_4b_local.sh`           |
+| Main — Qwen3-8B-Base, R1           | `bash scripts/main_qwen3_8b_base.sh`            |
+| Main — Llama-3.1-8B-Instruct       | `bash scripts/main_llama3_8b_instruct.sh`       |
+| Ablation — no Phase 1              | `bash scripts/ablation_no_phase1.sh`            |
+| Ablation — δ-cutoff sweep          | `bash scripts/ablation_cutoffs.sh`              |
+| Ablation — pool-size scaling       | `bash scripts/ablation_scaling.sh`              |
+| Ablation — multi-round (R1 → R3)   | `bash scripts/ablation_multi_round.sh`          |
+| Eval-only on existing adapter      | `bash scripts/eval_only.sh <adapter_dir>`       |
 
-All scripts forward extra flags to `g_zero/main.py` — e.g. add
-`--eval_tasks aime24,aime25` to skip the slow Alpaca step during
-ablations.
+All scripts forward extra flags to `g_zero/main.py`. The default evaluation
+tasks are AIME 2024 and AIME 2025. IFEval and AlpacaEval are excluded from
+this local pipeline.
+
+The completed local 4B mean@32 experiment and Agent-0 comparison are in
+[`reports/gzero_4b_agent0_mean32.md`](reports/gzero_4b_agent0_mean32.md).
 
 ### One-command default
 
@@ -161,20 +165,21 @@ Override **any** Config field as `--field value`; see
 ```
 runs/<tag>/
 ├── challenger/
-│   ├── checkpoints.jsonl         # Tinker URIs of trained Challenger
+│   ├── final/                   # local PEFT adapter
+│   ├── state.pt                 # optimizer and step for resume
 │   ├── metrics.jsonl             # reward / δ / valid_frac / hint length per step
 │   └── logs.log
+├── qh_pool.jsonl                 # Phase 2 question/hint inputs for resume
 ├── raw_pool.jsonl                # Phase 2 full scored pool (q, h, a_hard, a_assisted, δ)
 ├── dpo_data.jsonl                # Phase 2 filtered (prompt, chosen, rejected, δ)
 ├── solver/
-│   ├── checkpoints.jsonl         # Tinker URIs of trained Solver
+│   ├── final/                   # local PEFT adapter
+│   ├── state.pt                 # optimizer and step for resume
 │   ├── metrics.jsonl             # DPO loss / accuracy / margin per step
 │   └── logs.log
 └── eval/
     ├── results_aime24.jsonl
     ├── results_aime25.jsonl
-    ├── results_ifeval.json
-    ├── alpaca_eval/summary.json
     └── summary.json              # all metrics flattened
 ```
 
@@ -248,15 +253,15 @@ release/
     ├── prompts.py             ← Challenger / Solver prompts
     ├── parse.py               ← <question>/<hint> XML extractor
     ├── bleu_penalty.py        ← BLEU-cluster duplication penalty (Phase 1)
-    ├── hint_delta.py          ← δ via Tinker compute_logprobs
+    ├── local_backend.py        ← vLLM generation and token log probabilities
+    ├── local_training.py       ← PEFT LoRA training helpers
+    ├── hint_delta.py          ← δ via local teacher-forced log probabilities
     ├── phase1.py              ← Challenger GRPO
     ├── phase2.py              ← (q, h) generation + δ-scoring + filtering
     ├── phase3.py              ← Solver DPO
     ├── multi_round.py         ← outer loop over rounds (resumable)
     ├── eval.py                ← eval dispatcher
     ├── eval_aime.py           ← AIME 2024 / 2025 mean@32
-    ├── eval_ifeval.py         ← IFEval (rule-based)
-    ├── eval_alpaca.py         ← AlpacaEval LC win rate, Tinker-hosted judge
     └── main.py                ← phases 1+2+3+eval, single round
 ```
 
@@ -269,21 +274,25 @@ training. This makes it easy to swap in a different Solver update rule
 
 ## Caching & resumability
 
-- **Phase 2 pool**: `raw_pool.jsonl` is cached. Changing `pct_low /
-  pct_high / chosen_*` filters and re-running only re-runs the filter
-  step.
+- **Phase 2 pool**: `qh_pool.jsonl` and `raw_pool.jsonl` are cached. To try
+  different `pct_low` / `pct_high` or `chosen_*` filters, use a new tag and
+  reuse the raw pool as `scripts/ablation_cutoffs.sh` does.
 - **DPO data**: `dpo_data.jsonl` is similarly cached.
-- **Solver / Challenger checkpoints**: persisted as Tinker URIs in
-  `checkpoints.jsonl`; `eval_only.sh` can re-run eval on any of them.
+- **Solver / Challenger checkpoints**: saved as local PEFT adapters in
+  `final/`, with per-step adapters and optimizer state for resume.
+  `eval_only.sh` accepts a local adapter directory.
 - **Multi-round**: per-round resume state in `runs/<tag>/resume_state.json`
   — re-running the same command picks up at the next round.
+- **Run configuration**: `config.json` prevents accidentally resuming a tag
+  with changed settings; choose a new tag for a different configuration.
 
 ---
 
 ## Configuration knobs that matter
 
-The defaults in [`g_zero/config.py`](g_zero/config.py) reproduce the
-paper-main numbers. Knobs that are *load-bearing*:
+The defaults in [`g_zero/config.py`](g_zero/config.py) follow the original
+hyperparameters. Local numerical parity and paper results remain unverified.
+Knobs that are *load-bearing*:
 
 | Field                            | Default | Why it matters |
 |----------------------------------|---------|----------------|
@@ -291,10 +300,9 @@ paper-main numbers. Knobs that are *load-bearing*:
 | `hint_length_target_chars`       | 200     | Length-hinge target — without it, Challenger reward-hacks. |
 | `hint_length_penalty_lambda`     | 0.03    | Hinge weight. Larger → shorter hints → less signal. |
 | `dpo_beta`                       | 2.0     | DPO temperature; lower-than-typical because the chosen / rejected gap is small in the open-ended regime. |
-| `dpo_lr`                         | 1e-5    | DPO has a narrow, model-dependent sweet spot. Always check Alpaca after DPO. |
+| `dpo_lr`                         | 1e-5    | DPO has a narrow, model-dependent sweet spot. Check AIME after DPO. |
 | `solver_max_tokens`              | 8192    | Truncating responses below this loses real signal — bot50 ≠ short responses. |
 | `aime_temperature`               | 0.7     | mean@32 needs > 0 to actually sample different paths. |
-| `alpaca_judge_model`             | Qwen3-235B-A22B-Instruct-2507 | Llama-3.1-70B has severe position bias on this template. |
 
 ---
 
@@ -316,14 +324,7 @@ paper-main numbers. Knobs that are *load-bearing*:
 
 ## Acknowledgments
 
-This release runs end-to-end on
-[Tinker](https://thinkingmachines.ai/tinker) and uses the open-source
-[`tinker-cookbook`](https://github.com/thinking-machines-lab/tinker-cookbook)
-for renderers, checkpoint utils, and ML logging. AlpacaEval prompts and
-GPT-4-Turbo reference outputs come from
-[`tatsu-lab/alpaca_eval`](https://huggingface.co/datasets/tatsu-lab/alpaca_eval);
-IFEval verifiers from
-[google-research/instruction_following_eval](https://github.com/google-research/google-research/tree/master/instruction_following_eval);
+The original research used Tinker; this local port uses vLLM and PEFT.
 AIME problems from `Maxwell-Jia/AIME_2024` and `yentinglin/aime_2025`.
 
 We gratefully acknowledge the Thinking Machines Lab Tinker Research Grant for supporting the experimental efforts of this work. This research was also supported in part by the NVIDIA Academic Grant Program and WashU Ignite Interdisciplinary Grants.

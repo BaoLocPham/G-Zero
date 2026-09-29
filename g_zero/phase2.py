@@ -10,19 +10,16 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 import zlib
 from pathlib import Path
 
 import numpy as np
-import tinker
-from tinker import types
-
-from tinker_cookbook import renderers
-from tinker_cookbook.tokenizer_utils import get_tokenizer
 
 from .config import Config
 from .hint_delta import QHScore, score_batch
+from .local_backend import LocalBackend
 from .parse import extract_qh
 from .prompts import build_challenger_convo
 
@@ -31,14 +28,13 @@ logger = logging.getLogger(__name__)
 
 def _challenger_generate_qh(
     *,
-    challenger_sampling: tinker.SamplingClient,
-    renderer,
-    tokenizer,
+    backend: LocalBackend,
+    adapter_path: str | None,
     num_samples: int,
-    sampling_params: types.SamplingParams,
-    chunk_size: int = 64,
+    max_tokens: int,
+    chunk_size: int = 16,
 ) -> list[tuple[str, str]]:
-    prompt = renderer.build_generation_prompt(build_challenger_convo())
+    prompt = backend.prompt(build_challenger_convo())
     pairs: list[tuple[str, str]] = []
     remaining = num_samples
     done = 0
@@ -48,11 +44,12 @@ def _challenger_generate_qh(
     while remaining > 0:
         n = min(chunk_size, remaining)
         t_chunk = time.time()
-        res = challenger_sampling.sample(
-            prompt=prompt, num_samples=n, sampling_params=sampling_params
-        ).result()
-        for seq in res.sequences:
-            q, h = extract_qh(tokenizer.decode(list(seq.tokens)))
+        res = backend.generate_batch(
+            [prompt], n=n, max_tokens=max_tokens, temperature=1.0,
+            adapter_path=adapter_path,
+        )[0]
+        for seq in res:
+            q, h = extract_qh(backend.decode(seq.tokens))
             if q and h:
                 pairs.append((q, h))
         done += n
@@ -70,30 +67,24 @@ def _challenger_generate_qh(
     return pairs
 
 
-def _dump_raw_pool(pool: list[QHScore], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
-        for s in pool:
-            f.write(json.dumps({
-                "question": s.question,
-                "hint": s.hint,
-                "a_hard": s.a_hard,
-                "a_assisted": s.a_assisted,
-                "logp_q": s.logp_q,
-                "logp_qh": s.logp_qh,
-                "delta": s.delta,
-            }, ensure_ascii=False) + "\n")
-    logger.info("  wrote raw pool: %s (%d records)", path, len(pool))
-
-
-def _load_raw_pool(path: Path) -> list[QHScore]:
+def _load_raw_pool(path: Path, *, repair_tail: bool = False) -> list[QHScore]:
     pool: list[QHScore] = []
-    with open(path) as f:
-        for line in f:
-            line = line.strip()
+    with path.open("r+b" if repair_tail else "rb") as f:
+        while True:
+            offset = f.tell()
+            line = f.readline()
             if not line:
+                break
+            if not line.strip():
                 continue
-            r = json.loads(line)
+            try:
+                r = json.loads(line)
+            except json.JSONDecodeError:
+                if repair_tail and not f.read(1):
+                    f.truncate(offset)
+                    logger.warning("Removed incomplete last raw-pool record at byte %d", offset)
+                    break
+                raise
             pool.append(QHScore(
                 question=r.get("question", ""),
                 hint=r.get("hint", ""),
@@ -130,11 +121,11 @@ def build_dpo_dataset(
     *,
     challenger_sampling_path: str | None = None,
     solver_sampling_path: str | None = None,
+    backend: LocalBackend | None = None,
 ) -> Path:
     """Build (and cache) the DPO pool. Returns path to dpo_data.jsonl.
 
-    challenger_sampling_path / solver_sampling_path:
-      tinker:// URI for trained checkpoint, or None to use base model.
+    Adapter directory paths, or None to use the base model.
     """
     out_path = config.dpo_data_path()
     raw_pool_path = config.raw_pool_path()
@@ -144,51 +135,68 @@ def build_dpo_dataset(
         logger.info("Phase 2: %s already exists, skipping", out_path)
         return out_path
 
-    # Load cached raw pool, or generate it.
-    if raw_pool_path.exists():
-        logger.info("Phase 2: found cached raw pool at %s, skipping generation", raw_pool_path)
-        scored = _load_raw_pool(raw_pool_path)
-    else:
-        tokenizer = get_tokenizer(config.model_name)
-        renderer = renderers.get_renderer(config.renderer_name, tokenizer)
-        service = tinker.ServiceClient(base_url=config.base_url)
+    qh_pool_path = config.run_dir() / "qh_pool.jsonl"
+    scored = _load_raw_pool(
+        raw_pool_path,
+        repair_tail=qh_pool_path.exists() and not raw_pool_path.is_symlink(),
+    ) if raw_pool_path.exists() else []
+    # An externally linked raw pool is complete by construction (cutoff sweeps).
+    if not raw_pool_path.exists() or qh_pool_path.exists():
+        if qh_pool_path.exists():
+            qh_pairs = [
+                (row["question"], row["hint"])
+                for row in (json.loads(line) for line in qh_pool_path.read_text().splitlines())
+            ]
+        else:
+            backend = backend or LocalBackend(config)
+            logger.info("Phase 2a: generating (q, h) pool...")
+            qh_pairs = _challenger_generate_qh(
+                backend=backend, adapter_path=challenger_sampling_path,
+                num_samples=config.num_questions,
+                max_tokens=config.challenger_max_tokens,
+                chunk_size=config.inference_batch_size,
+            )
+            qh_pool_path.parent.mkdir(parents=True, exist_ok=True)
+            qh_tmp = qh_pool_path.with_suffix(".jsonl.tmp")
+            with qh_tmp.open("w") as handle:
+                for q, h in qh_pairs:
+                    handle.write(json.dumps({"question": q, "hint": h}) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(qh_tmp, qh_pool_path)
+            logger.info("  got %d valid (q, h) pairs", len(qh_pairs))
+        if not qh_pairs:
+            raise RuntimeError("Challenger generated no valid question/hint pairs")
+        if len(scored) > len(qh_pairs):
+            raise RuntimeError("raw pool has more rows than the saved question/hint pool")
+        if len(scored) < len(qh_pairs):
+            backend = backend or LocalBackend(config)
+            logger.info("Phase 2b: scoring Solver from row %d/%d", len(scored), len(qh_pairs))
+            raw_pool_path.parent.mkdir(parents=True, exist_ok=True)
+            with raw_pool_path.open("a") as handle:
+                for start in range(len(scored), len(qh_pairs), config.inference_batch_size):
+                    chunk = score_batch(
+                        backend, qh_pairs[start : start + config.inference_batch_size],
+                        mode="full", adapter_path=solver_sampling_path,
+                        max_tokens=config.solver_max_tokens,
+                        temperature=config.solver_sample_temperature,
+                        batch_size=config.inference_batch_size,
+                    )
+                    for s in chunk:
+                        handle.write(json.dumps({
+                            "question": s.question, "hint": s.hint,
+                            "a_hard": s.a_hard, "a_assisted": s.a_assisted,
+                            "logp_q": s.logp_q, "logp_qh": s.logp_qh,
+                            "delta": s.delta,
+                        }, ensure_ascii=False) + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                    scored.extend(chunk)
+                    logger.info("  scored %d/%d", len(scored), len(qh_pairs))
 
-        challenger_sampling = service.create_sampling_client(
-            base_model=config.model_name, model_path=challenger_sampling_path
-        )
-        solver_sampling = service.create_sampling_client(
-            base_model=config.model_name, model_path=solver_sampling_path
-        )
-
-        challenger_sp = types.SamplingParams(
-            max_tokens=config.challenger_max_tokens, temperature=1.0,
-            stop=renderer.get_stop_sequences(),
-        )
-        solver_sp = types.SamplingParams(
-            max_tokens=config.solver_max_tokens,
-            temperature=config.solver_sample_temperature,
-            stop=renderer.get_stop_sequences(),
-        )
-
-        logger.info("Phase 2a: generating (q, h) pool...")
-        qh_pairs = _challenger_generate_qh(
-            challenger_sampling=challenger_sampling,
-            renderer=renderer, tokenizer=tokenizer,
-            num_samples=config.num_questions,
-            sampling_params=challenger_sp,
-        )
-        logger.info("  got %d valid (q, h) pairs", len(qh_pairs))
-
-        logger.info("Phase 2b: scoring with Solver (sampling a_hard, a_assisted, computing δ)...")
-        scored = score_batch(
-            solver_sampling, renderer, tokenizer, qh_pairs,
-            mode="full", sampling_params=solver_sp,
-        )
-        # Drop empties before caching so the saved pool is directly usable.
-        scored = [s for s in scored if s.a_hard.strip() and s.a_assisted.strip()]
-        if not scored:
-            raise SystemExit("Phase 2: no valid scored records.")
-        _dump_raw_pool(scored, raw_pool_path)
+    scored = [s for s in scored if s.a_hard.strip() and s.a_assisted.strip()]
+    if not scored:
+        raise RuntimeError("Phase 2 has no nonempty scored records")
 
     # Filter by δ-percentile
     deltas = np.array([s.delta for s in scored], dtype=np.float64)
@@ -234,7 +242,8 @@ def build_dpo_dataset(
         raise SystemExit("Phase 2: all pairs dropped by quality filters; relax thresholds.")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w") as f:
+    out_tmp = out_path.with_suffix(".jsonl.tmp")
+    with open(out_tmp, "w") as f:
         for s in kept:
             f.write(json.dumps({
                 "prompt": s.question,
@@ -242,5 +251,8 @@ def build_dpo_dataset(
                 "rejected": s.a_hard,
                 "delta": s.delta,
             }, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(out_tmp, out_path)
     logger.info("  wrote %s", out_path)
     return out_path

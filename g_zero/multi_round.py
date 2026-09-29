@@ -18,11 +18,15 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 from copy import deepcopy
 from pathlib import Path
 
+import torch
+
 from .config import Config, parse_cli_overrides
 from .eval import evaluate
+from .local_backend import LocalBackend
 from .phase1 import train_challenger
 from .phase2 import build_dpo_dataset
 from .phase3 import train_solver_dpo
@@ -67,7 +71,11 @@ def _save_resume(run_dir: Path, state: dict) -> None:
 def run_multi_round(config: Config, num_rounds: int) -> dict[int, dict[str, float]]:
     run_dir = Path(config.storage_path) / config.tag
     run_dir.mkdir(parents=True, exist_ok=True)
+    config.save_run_config(run_dir / "config.json")
+    random.seed(config.seed)
     logger.info("Multi-round run dir: %s  (rounds=%d)", run_dir, num_rounds)
+    backend = LocalBackend(config)
+    torch.manual_seed(config.seed)
 
     prev_challenger_state: str | None = None
     prev_solver_state: str | None = None
@@ -96,6 +104,7 @@ def run_multi_round(config: Config, num_rounds: int) -> dict[int, dict[str, floa
                 challenger_init_path=prev_challenger_state,
                 solver_sampling_path=prev_solver_sampling,
                 save_path=str(rcfg.challenger_save_dir()),
+                backend=backend,
             )
             challenger_sampler = _sampler(ch_result)
             challenger_state = _state(ch_result)
@@ -109,6 +118,7 @@ def run_multi_round(config: Config, num_rounds: int) -> dict[int, dict[str, floa
             rcfg,
             challenger_sampling_path=challenger_sampler,
             solver_sampling_path=prev_solver_sampling,
+            backend=backend,
         )
 
         # Phase 3: prev solver → DPO
@@ -117,6 +127,7 @@ def run_multi_round(config: Config, num_rounds: int) -> dict[int, dict[str, floa
             solver_init_path=prev_solver_state,
             data_path=rcfg.dpo_data_path(),
             save_path=str(rcfg.solver_save_dir()),
+            backend=backend,
         )
         solver_sampler = _sampler(sv_result)
         solver_state = _state(sv_result)
@@ -133,10 +144,9 @@ def run_multi_round(config: Config, num_rounds: int) -> dict[int, dict[str, floa
             "solver_sampling": solver_sampler,
         })
 
-        # Eval per round (cheap ablations with eval_tasks=aime24,aime25 are
-        # ~1h; full quartet adds ~30min for Alpaca).
+        # Evaluate each round with the selected local, judge-free tasks.
         try:
-            results[k] = evaluate(rcfg, sampler_path=solver_sampler)
+            results[k] = evaluate(rcfg, sampler_path=solver_sampler, backend=backend)
         except Exception as e:  # noqa: BLE001
             logger.exception("round %d eval failed: %s", k, e)
             results[k] = {}

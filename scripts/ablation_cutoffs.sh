@@ -3,7 +3,7 @@
 #
 # Reuses one Phase-2 raw_pool across cutoffs by only re-running Phase 2's
 # *filter* + Phase 3 (DPO) + eval per cutoff. We do this by:
-#   1. Generating the pool once under a "_pool" tag.
+#   1. Generating the pool once under a "_pool" tag, without DPO/eval.
 #   2. Symlinking raw_pool.jsonl into each cutoff tag.
 #   3. Running with that tag — main.py sees the cached pool and skips
 #      generation, then re-filters according to --pct_low/--pct_high.
@@ -15,15 +15,14 @@ cd "$(dirname "$0")/.."
 
 POOL_TAG="ablation_cutoffs/_pool"
 MODEL=${MODEL:-Qwen/Qwen3-8B-Base}
-RENDERER=${RENDERER:-qwen3}
 NQ=${NQ:-3000}
 
 # 1. Build the pool once.
 bash run.sh \
   --tag "$POOL_TAG" \
   --model_name "$MODEL" \
-  --renderer_name "$RENDERER" \
   --run_phase1 true \
+  --stop_after_phase2 true \
   --num_questions "$NQ" \
   --pct_low 0 --pct_high 50 \
   --eval_tasks aime24,aime25
@@ -43,7 +42,6 @@ for cut in "0:10" "0:25" "0:50" "0:75" "50:100"; do
   bash run.sh \
     --tag "$TAG" \
     --model_name "$MODEL" \
-    --renderer_name "$RENDERER" \
     --run_phase1 false \
     --num_questions "$NQ" \
     --pct_low "$lo" --pct_high "$hi" \

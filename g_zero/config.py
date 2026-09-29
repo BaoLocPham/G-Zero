@@ -1,13 +1,14 @@
 """All G-Zero hyperparameters in one place.
 
-Defaults reproduce the paper-main configuration on Qwen3-8B-Base.
-Override any field via CLI: `python -m g_zero.main --field value`.
+Defaults use the locally cached Qwen3-4B-Base model.
+Override any field via CLI: `python3 -m g_zero.main --field value`.
 """
 from __future__ import annotations
 
 import argparse
+import json
 import os
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 
@@ -22,18 +23,23 @@ class Config:
     )
 
     # ─── Model ───────────────────────────────────────────────────────────────
-    # Any model exposed by Tinker. Renderer must match the model's chat format.
-    # Examples that ship with tinker_cookbook: "qwen3", "qwen3_instruct",
-    # "llama3", "llama3_instruct".
-    model_name: str = "Qwen/Qwen3-8B-Base"
-    renderer_name: str = "qwen3"
-    base_url: str | None = None
+    # Local Hugging Face model with a tokenizer chat template.
+    model_name: str = "/home/locpb/self-evolution-repro/papers/agent0/shared-models/Qwen3-4B-Base"
+    model_revision: str | None = None
+    seed: int = 42
     lora_rank: int = 32
+    max_model_len: int = 32768
+    vllm_gpu_memory_utilization: float = 0.85
+    vllm_enforce_eager: bool = True
+    vllm_tensor_parallel_size: int = 1
+    training_device: str = "cuda:1"
+    inference_batch_size: int = 16
 
     # ─── Phase 1: Challenger GRPO ────────────────────────────────────────────
     # Set run_phase1=False to skip; the base model is then used directly as
     # the Challenger. Default is on — runs 6 GRPO steps before Phase 2.
     run_phase1: bool = True
+    stop_after_phase2: bool = False               # generate/filter pool only
     challenger_steps: int = 6                       # GRPO steps
     challenger_batch_size: int = 8                  # # of "problems" per step
     challenger_group_size: int = 16                 # rollouts per problem
@@ -73,14 +79,13 @@ class Config:
     # ─── Eval ────────────────────────────────────────────────────────────────
     eval_max_tokens: int = 16384
     aime_temperature: float = 0.7                   # mean@k requires > 0
-    eval_concurrency: int = 32
+    aime_top_p: float = 0.95
+    aime_samples_per_problem: int = 1
+    aime_seed_2024: int = 2026092201
+    aime_seed_2025: int = 2026092202
 
-    # AlpacaEval judge — Tinker-hosted MoE 235B; less position-biased than 70B
-    alpaca_judge_model: str = "Qwen/Qwen3-235B-A22B-Instruct-2507"
-    alpaca_judge_renderer: str = "qwen3_instruct"
-
-    # Eval task selector — comma-separated subset of {aime24,aime25,ifeval,alpaca}
-    eval_tasks: str = "aime24,aime25,ifeval,alpaca"
+    # Eval task selector — comma-separated subset of {aime24,aime25}
+    eval_tasks: str = "aime24,aime25"
 
     # ─── Per-run paths ───────────────────────────────────────────────────────
     def run_dir(self) -> Path:
@@ -100,6 +105,14 @@ class Config:
 
     def eval_dir(self) -> Path:
         return self.run_dir() / "eval"
+
+    def save_run_config(self, path: Path | None = None) -> None:
+        """Refuse to reuse cached data under a changed configuration."""
+        path = path or self.run_dir() / "config.json"
+        current = json.loads(json.dumps(asdict(self)))
+        if path.exists() and json.loads(path.read_text()) != current:
+            raise RuntimeError(f"run configuration changed at {path}; use a new tag")
+        path.write_text(json.dumps(current, indent=2))
 
 
 def parse_cli_overrides(argv: list[str] | None = None) -> Config:

@@ -5,8 +5,8 @@ Design notes:
     echo system messages back into the assistant response in ~5–15% of
     rollouts; this contaminates DPO training data, since the echoed prefix
     appears in both `chosen` and `rejected` strings and the model partially
-    learns to reproduce it (hurts IFEval). The eval-time `Please reason ...
-    \\boxed{}` system prompt lives separately in eval.py.
+    learns to reproduce it. The eval-time math system prompt lives separately
+    in eval_aime.py.
 """
 from __future__ import annotations
 

@@ -5,18 +5,14 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-if [[ -z "${TINKER_API_KEY:-}" ]]; then
-  echo "ERROR: TINKER_API_KEY is not set." >&2
+if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
+  echo "Set CUDA_VISIBLE_DEVICES to two GPU IDs, in inference,training order." >&2
   exit 1
 fi
 
-# punkt for the BLEU diversity penalty (Phase 1)
-python -c "import nltk; nltk.download('punkt_tab', quiet=True); nltk.download('punkt', quiet=True)" 2>/dev/null || true
-
-exec python -m g_zero.multi_round \
+exec "${PYTHON_BIN:-python3}" -m g_zero.multi_round \
   --tag ablation_multi_round \
   --model_name Qwen/Qwen3-8B-Base \
-  --renderer_name qwen3 \
   --run_phase1 true \
   --num_questions 2000 \
   --pct_low 0 --pct_high 50 \
