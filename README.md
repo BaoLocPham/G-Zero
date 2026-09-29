@@ -112,7 +112,7 @@ snapshot via `save_weights_and_get_sampling_client`).
 ## Setup
 
 ```bash
-git clone <this-repo> && cd G-Zero/
+git clone https://github.com/BaoLocPham/G-Zero.git && cd G-Zero/
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 export CUDA_VISIBLE_DEVICES=2,3          # training: first visible GPU runs vLLM, second runs PEFT
@@ -121,11 +121,85 @@ export CUDA_VISIBLE_DEVICES=2,3          # training: first visible GPU runs vLLM
 Training uses two visible NVIDIA GPUs. Inference-only evaluation supports
 tensor parallelism over two GPUs with `--vllm_tensor_parallel_size 2`.
 The default model is the cached Qwen3-4B-Base at
-`/home/locpb/self-evolution-repro/papers/agent0/shared-models/Qwen3-4B-Base`. Evaluation datasets are
-downloaded from Hugging Face on first use; inference and training then run
-locally. No judge model or model-calling API is used. The local 4B bot50 and
-top50 adapters have completed one training round. Set `--model_name` to use a
-different model.
+`/home/locpb/self-evolution-repro/papers/agent0/shared-models/Qwen3-4B-Base`.
+Set `--model_name` to use a different local model directory. AIME evaluation
+currently reads `/home/locpb/self-evolution-repro/benchmarks/aime_2024.json`
+and `aime_2025.json`; these files must be present. Inference and training run
+locally, without a judge model or model-calling API.
+
+### Reproduce the compute-limited 4B run on this machine
+
+This is the one-round, Phase-1-off experiment in
+[`reports/gzero_4b_agent0_mean32.md`](reports/gzero_4b_agent0_mean32.md).
+It uses the same local model and AIME files as the completed Agent-0 run.
+Run these commands from the repository root. Choose new tags for a fresh run;
+the pipeline resumes cached data when a tag already exists.
+
+```bash
+export PYTHON_BIN=.venv/bin/python
+export MODEL_DIR=/home/locpb/self-evolution-repro/papers/agent0/shared-models/Qwen3-4B-Base
+export CUDA_VISIBLE_DEVICES=2,3
+test -f "$MODEL_DIR/config.json"
+test -f /home/locpb/self-evolution-repro/benchmarks/aime_2024.json
+test -f /home/locpb/self-evolution-repro/benchmarks/aime_2025.json
+
+# Bot50: 256 Challenger attempts, one Solver DPO round, 10 steps.
+bash run.sh \
+  --tag local_4b_bot50 --model_name "$MODEL_DIR" \
+  --run_phase1 false --num_questions 256 \
+  --challenger_max_tokens 768 --solver_max_tokens 1024 \
+  --pct_low 0 --pct_high 50 \
+  --dpo_batch_size 4 --dpo_max_steps 10 \
+  --max_model_len 4096 --inference_batch_size 8 \
+  --vllm_gpu_memory_utilization 0.25 --eval_max_tokens 2048
+
+# Top50 control: re-filter the same scored pool and train a fresh adapter.
+mkdir -p runs/local_4b_top50
+ln -sfn "$(pwd)/runs/local_4b_bot50/raw_pool.jsonl" runs/local_4b_top50/raw_pool.jsonl
+bash run.sh \
+  --tag local_4b_top50 --model_name "$MODEL_DIR" \
+  --run_phase1 false --num_questions 256 \
+  --challenger_max_tokens 768 --solver_max_tokens 1024 \
+  --pct_low 50 --pct_high 100 \
+  --dpo_batch_size 4 --dpo_max_steps 10 \
+  --max_model_len 4096 --inference_batch_size 8 \
+  --vllm_gpu_memory_utilization 0.25 --eval_max_tokens 2048
+```
+
+Each training command also runs a quick AIME mean@1 evaluation. For the
+paper-aligned mean@32 comparison, evaluate the base model and both native LoRA
+adapters with the same settings. Any free GPU pair can be selected.
+
+```bash
+export CUDA_VISIBLE_DEVICES=2,3
+EVAL_ARGS=(
+  --model_name "$MODEL_DIR" --eval_tasks aime24,aime25
+  --aime_samples_per_problem 32 --eval_max_tokens 2048
+  --aime_temperature 0.7 --aime_top_p 0.95
+  --max_model_len 4096 --inference_batch_size 64
+  --vllm_tensor_parallel_size 2 --vllm_gpu_memory_utilization 0.9
+)
+
+bash scripts/eval_only.sh base \
+  --tag local_4b_base_mean32 "${EVAL_ARGS[@]}"
+bash scripts/eval_only.sh runs/local_4b_bot50/solver/final \
+  --tag local_4b_bot50_mean32 "${EVAL_ARGS[@]}"
+bash scripts/eval_only.sh runs/local_4b_top50/solver/final \
+  --tag local_4b_top50_mean32 "${EVAL_ARGS[@]}"
+
+.venv/bin/python scripts/compare_agent0_aime.py \
+  --base runs/local_4b_base_mean32 \
+  --bot50 runs/local_4b_bot50_mean32 \
+  --top50 runs/local_4b_top50_mean32 --k 32 \
+  --output reports/local_4b_agent0_mean32.md
+```
+
+Each mean@32 evaluation generates 960 completions per AIME year and saves
+incremental JSONL files under `runs/<tag>/eval/`. The comparison command uses
+the saved Agent-0 results at
+`/home/locpb/self-evolution-repro/papers/agent0/evaluation/paper-aligned-aime-v1`.
+On another machine, provide the same benchmark JSON files and update the
+absolute paths in `g_zero/eval_aime.py` and `scripts/compare_agent0_aime.py`.
 
 ---
 
@@ -152,7 +226,7 @@ The completed local 4B mean@32 experiment and Agent-0 comparison are in
 ### One-command default
 
 ```bash
-bash run.sh                           # = scripts/main_qwen3_8b_base.sh
+bash run.sh                           # uses the local 4B default and full-size settings
 bash run.sh --run_phase1 false        # no_phase1 ablation
 bash run.sh --tag big --num_questions 5000
 ```
